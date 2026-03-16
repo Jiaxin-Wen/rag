@@ -20,12 +20,18 @@ MODEL = "meta-llama/llama-3.1-8b-instruct"
 FALLBACK_MODELS = ["qwen/qwen-2.5-7b-instruct", "mistralai/mistral-7b-instruct"]
 
 SYSTEM_PROMPT = """You answer factoid questions about UC Berkeley EECS using provided context.
-Give ONLY the direct short answer. No explanation. No full sentences. No extra words.
-Maximum 5 words. Usually 1-3 words is best.
-For "how many" questions, give JUST the number.
-For "who" questions, give JUST the name.
-For "where/which university" questions, give JUST the university name.
-Copy names/dates/numbers EXACTLY from context. No preamble."""
+Rules:
+- Give ONLY the direct short answer. No explanation. No full sentences.
+- Maximum 5 words. Usually 1-3 words is best.
+- For "how many" questions, give JUST the number (e.g. "6" or "3").
+- For "who" questions, give JUST the full name.
+- For "where/which university" questions, give JUST the university name.
+- Copy names/dates/numbers EXACTLY as they appear in context.
+- When asked about "earliest", "oldest", "first", etc., carefully compare ALL entries before answering.
+- When the question asks about a SPECIFIC category (e.g. "minor credits" not "major credits"), read the context carefully to find the exact matching category.
+- When multiple documents discuss similar topics, pick the one that best matches the question's specific details.
+- Read ALL provided passages before answering, not just the first one.
+- No preamble, no explanation."""
 
 
 def tokenize(text):
@@ -60,26 +66,40 @@ def generate_query_variants(question):
     for course in courses:
         variants.append(f"{course} Berkeley EECS course description")
 
-    if "advisor" in q_lower:
-        variants.append("student advisor advising office contact CS EECS")
-    if "born" in q_lower or "earliest" in q_lower or "oldest" in q_lower:
-        variants.append("faculty in memoriam born deceased professors 1891 1897 1900 1904")
-        variants.append("in memoriam professors obituary earliest oldest born year")
+    # Thesis/dissertation questions
     if "thesis" in q_lower or "dissertation" in q_lower:
-        variants.append("thesis technical report EECS 2024 advisor")
-        variants.append("protein evolution thesis PhD 2024")
+        variants.append("thesis technical report EECS advisor")
+        # Extract year if mentioned
+        year_match = re.search(r'\b(20\d{2})\b', question)
+        if year_match:
+            variants.append(f"technical report EECS {year_match.group(1)}")
+    # Faculty/people questions
+    if "born" in q_lower or "earliest" in q_lower or "oldest" in q_lower:
+        variants.append("in memoriam faculty born deceased professors")
+    if "advisor" in q_lower and "thesis" not in q_lower:
+        variants.append("student advisor advising office contact")
+    # Course schedule questions
     if "teaching" in q_lower or ("how many" in q_lower and "course" in q_lower):
-        variants.append("schedule draft teaching courses spring instructor")
-    if "credits" in q_lower or "minor" in q_lower:
-        variants.append("PhD coursework minor credits requirements units")
+        variants.append("schedule draft teaching courses instructor")
+    if "schedule" in q_lower or "spring" in q_lower or "fall" in q_lower:
+        variants.append("EE CS schedule draft courses")
+    # Degree requirements
+    if "credits" in q_lower or "units" in q_lower or "minor" in q_lower:
+        variants.append("coursework credits requirements units")
     if "master" in q_lower:
-        variants.append("masters degree education university background")
+        variants.append("masters degree education university")
     if "phd" in q_lower and ("where" in q_lower or "which" in q_lower):
-        variants.append("PhD degree education Stanford MIT university")
+        variants.append("PhD degree education university")
+    # Awards/deadlines
     if "award" in q_lower or "deadline" in q_lower:
-        variants.append("awards nomination deadline outstanding TA")
-    if "schedule" in q_lower or "spring" in q_lower:
-        variants.append("EE CS schedule draft spring courses")
+        variants.append("awards nomination deadline")
+    if "fellowship" in q_lower:
+        variants.append("fellowship award graduate student")
+    # Office/contact info
+    if "office" in q_lower or "room" in q_lower:
+        variants.append("office room hall contact")
+    if "email" in q_lower:
+        variants.append("email contact address")
 
     return variants
 
@@ -99,29 +119,28 @@ def score_url(question, url, best_chunk_score):
                 bonus += 20
 
     # URL-type matching
-    if "advisor" in q_lower and "advising" in url_lower:
+    if "advisor" in q_lower and "thesis" not in q_lower and "advising" in url_lower:
         bonus += 25
-    if ("born" in q_lower or "earliest" in q_lower) and "memoriam" in url_lower:
+    if ("born" in q_lower or "earliest" in q_lower or "oldest" in q_lower) and "memoriam" in url_lower:
+        # Strongly prefer the main in-memoriam list page over individual memorial articles
+        if "/people/faculty/in-memoriam" in url_lower:
+            bonus += 50
+        else:
+            bonus += 10
+    if ("schedule" in q_lower or "teaching" in q_lower) and "schedule" in url_lower:
+        bonus += 20
+    if ("how many" in q_lower and "course" in q_lower) and "schedule" in url_lower:
+        bonus += 20
+    if ("credit" in q_lower or "coursework" in q_lower or "minor" in q_lower) and "coursework" in url_lower:
         bonus += 25
-    if "schedule" in q_lower and "schedule" in url_lower:
+    if ("thesis" in q_lower or "dissertation" in q_lower) and "Pubs/TechRpts" in url:
         bonus += 20
-    if "teaching" in q_lower and "schedule" in url_lower:
-        bonus += 20
-    if ("credit" in q_lower or "coursework" in q_lower) and "coursework" in url_lower:
-        bonus += 25
-    if "minor" in q_lower and ("phd" in url_lower or "coursework" in url_lower):
-        bonus += 20
-    if "thesis" in q_lower and "techreport" in url_lower.replace("/", ""):
-        bonus += 20
-    if "thesis" in q_lower and "Pubs" in url:
-        bonus += 15
     if ("master" in q_lower or "phd" in q_lower or "education" in q_lower):
         if "homepage" in url_lower or "Faculty/Homepages" in url:
             bonus += 15
         if "book/faculty" in url_lower:
             bonus += 15
     if "homepage" in url_lower or "Faculty/Homepages" in url:
-        # Bonus for faculty homepages when asking about a specific person
         for name in names:
             bonus += 5
 
@@ -180,11 +199,13 @@ def retrieve(question, bm25, docs, url_to_chunks, top_k=TOP_K_URLS):
 
 def build_prompt(question, passages):
     context_parts = []
+    # Give more space to the first (most relevant) passage
     for i, p in enumerate(passages, 1):
         text = p["text"]
         words = text.split()
-        if len(words) > 500:
-            text = " ".join(words[:500]) + "..."
+        max_words = 800 if i == 1 else 400
+        if len(words) > max_words:
+            text = " ".join(words[:max_words]) + "..."
         context_parts.append(f"[{i}] {p.get('title', '')} ({p['url']})\n{text}")
     context = "\n\n".join(context_parts)
 
@@ -194,7 +215,7 @@ def build_prompt(question, passages):
 
 Question: {question}
 
-Short answer:"""
+Answer with ONLY the exact short answer:"""
 
 
 def is_garbage(answer):
@@ -245,8 +266,8 @@ def clean_answer(answer):
         # If the core part looks like a complete answer, use it
         if len(core.split()) >= 1 and len(core.split()) <= 6:
             answer = core
-    # Remove "units" suffix from number answers
-    answer = re.sub(r'(\d+)\s+(?:semester\s+)?units?$', r'\1', answer, flags=re.IGNORECASE)
+    # Remove "units" suffix from number answers but preserve "+" suffix
+    answer = re.sub(r'(\d+\+?)\s+(?:semester\s+)?units?$', r'\1', answer, flags=re.IGNORECASE)
     # Truncate overly long answers
     words = answer.split()
     if len(words) > 10:
@@ -270,6 +291,21 @@ def safe_call_llm(query, system_prompt, model=MODEL, max_tokens=48):
     return "unknown"
 
 
+def filter_passages(question, passages):
+    """Remove redundant/noisy passages based on question type."""
+    q_lower = question.lower()
+
+    # For superlative questions (earliest, oldest, most, etc.), prefer list pages
+    # over individual articles that might distract the LLM
+    superlative_words = ["earliest", "oldest", "first", "most", "latest", "newest",
+                         "youngest", "largest", "smallest", "highest", "lowest"]
+    if any(w in q_lower for w in superlative_words):
+        # Keep only top 3 to reduce noise
+        return passages[:3]
+
+    return passages
+
+
 def answer_question(question, bm25, docs, url_to_chunks):
     passages = retrieve(question, bm25, docs, url_to_chunks)
     if not passages:
@@ -277,6 +313,7 @@ def answer_question(question, bm25, docs, url_to_chunks):
             f"Answer concisely about UC Berkeley EECS: {question}",
             SYSTEM_PROMPT,
         )
+    passages = filter_passages(question, passages)
     prompt = build_prompt(question, passages)
     answer = safe_call_llm(prompt, SYSTEM_PROMPT)
     if is_garbage(answer):
