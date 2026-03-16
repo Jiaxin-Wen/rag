@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+corpus/*.pkl
+corpus/chunks.jsonl
+corpus/pages.jsonl
+data/predictions.txt
+data/predictions_timing.txt
+.env
