@@ -14,8 +14,8 @@ DOCS_PATH = os.path.join(SCRIPT_DIR, "corpus", "docs.pkl")
 DENSE_INDEX_PATH = os.path.join(SCRIPT_DIR, "corpus", "dense_index.faiss")
 DENSE_DOCS_PATH = os.path.join(SCRIPT_DIR, "corpus", "dense_docs.pkl")
 
-MODEL_NAME = "google/embeddinggemma-300m"
-BATCH_SIZE = 64
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+BATCH_SIZE = 256
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
 
     # Encode
     print(f"Loading model {MODEL_NAME}...")
-    model = SentenceTransformer(MODEL_NAME, trust_remote_code=True)
+    model = SentenceTransformer(MODEL_NAME)
     print(f"Encoding {len(texts)} chunks...")
     embeddings = model.encode(texts, batch_size=BATCH_SIZE, show_progress_bar=True,
                               normalize_embeddings=True)

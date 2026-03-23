@@ -17,7 +17,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_PATH = os.path.join(SCRIPT_DIR, "corpus", "bm25_index.pkl")
 DOCS_PATH = os.path.join(SCRIPT_DIR, "corpus", "docs.pkl")
 DENSE_INDEX_PATH = os.path.join(SCRIPT_DIR, "corpus", "dense_index.faiss")
-DENSE_MODEL_NAME = os.path.join(SCRIPT_DIR, "models", "embeddinggemma-300m")
+DENSE_MODEL_NAME = os.path.join(SCRIPT_DIR, "models", "all-MiniLM-L6-v2")
 
 TOP_K_RETRIEVE = 100
 TOP_K_DENSE = 50
