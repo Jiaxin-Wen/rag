@@ -6,36 +6,53 @@ import os
 import re
 import json
 import pickle
+import unicodedata
 import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 from llm import call_llm, ALLOWED_MODELS
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_PATH = os.path.join(SCRIPT_DIR, "corpus", "bm25_index.pkl")
 DOCS_PATH = os.path.join(SCRIPT_DIR, "corpus", "docs.pkl")
+DENSE_INDEX_PATH = os.path.join(SCRIPT_DIR, "corpus", "dense_index.faiss")
+DENSE_MODEL_NAME = os.path.join(SCRIPT_DIR, "models", "embeddinggemma-300m")
 
 TOP_K_RETRIEVE = 100
+TOP_K_DENSE = 50
 TOP_K_URLS = 5
 MODEL = "meta-llama/llama-3.1-8b-instruct"
 FALLBACK_MODELS = ["qwen/qwen-2.5-7b-instruct", "mistralai/mistral-7b-instruct"]
 
 SYSTEM_PROMPT = """You answer factoid questions about UC Berkeley EECS using provided context.
+The current date is March 2026.
 Rules:
 - Give ONLY the direct short answer. No explanation. No full sentences.
 - Maximum 5 words. Usually 1-3 words is best.
-- For "how many" questions, give JUST the number (e.g. "6" or "3").
-- For "who" questions, give JUST the full name.
+- For "how many" questions, give JUST the number (e.g. "6" or "3"). Count carefully.
+- For "who" questions, give JUST the full name exactly as written in context.
 - For "where/which university" questions, give JUST the university name.
+- For yes/no questions, answer ONLY "Yes" or "No". Read the context carefully before answering.
 - Copy names/dates/numbers EXACTLY as they appear in context.
 - When asked about "earliest", "oldest", "first", etc., carefully compare ALL entries before answering.
 - When the question asks about a SPECIFIC category (e.g. "minor credits" not "major credits"), read the context carefully to find the exact matching category.
 - When multiple documents discuss similar topics, pick the one that best matches the question's specific details.
 - Read ALL provided passages before answering, not just the first one.
+- For percentage questions, give JUST the number (e.g. "14" or "48").
+- If the answer is not in the context, answer "unknown". Never answer "No" just because you cannot find the answer.
 - No preamble, no explanation."""
 
 
+def strip_diacritics(text):
+    """Remove diacritics for better matching (e.g. Gödel -> Godel)."""
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+
 def tokenize(text):
-    return re.findall(r'\w+', text.lower())
+    text = strip_diacritics(text.lower())
+    return re.findall(r'\w+', text)
 
 
 def load_index():
@@ -50,12 +67,24 @@ def load_index():
         if url not in url_to_chunks:
             url_to_chunks[url] = []
         url_to_chunks[url].append(i)
-    return bm25, docs, url_to_chunks
+    # Load dense index
+    dense_index = None
+    dense_model = None
+    if os.path.exists(DENSE_INDEX_PATH):
+        print("Loading dense index...", file=sys.stderr)
+        dense_index = faiss.read_index(DENSE_INDEX_PATH)
+        dense_model = SentenceTransformer(DENSE_MODEL_NAME)
+        print(f"Dense index loaded with {dense_index.ntotal} vectors.", file=sys.stderr)
+    return bm25, docs, url_to_chunks, dense_index, dense_model
 
 
 def generate_query_variants(question):
     """Generate multiple query formulations for better recall."""
     variants = [question]
+    # Also add diacritic-stripped version of the question
+    stripped = strip_diacritics(question)
+    if stripped != question:
+        variants.append(stripped)
     q_lower = question.lower()
     names = re.findall(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+', question)
     courses = re.findall(r'(?:CS|EE|EECS)\s*\d+\w*', question, re.IGNORECASE)
@@ -69,37 +98,80 @@ def generate_query_variants(question):
     # Thesis/dissertation questions
     if "thesis" in q_lower or "dissertation" in q_lower:
         variants.append("thesis technical report EECS advisor")
-        # Extract year if mentioned
         year_match = re.search(r'\b(20\d{2})\b', question)
         if year_match:
             variants.append(f"technical report EECS {year_match.group(1)}")
+            variants.append(f"dissertation {year_match.group(1)} EECS")
     # Faculty/people questions
     if "born" in q_lower or "earliest" in q_lower or "oldest" in q_lower:
         variants.append("in memoriam faculty born deceased professors")
+        variants.append("earliest born professor memoriam")
     if "advisor" in q_lower and "thesis" not in q_lower:
         variants.append("student advisor advising office contact")
     # Course schedule questions
-    if "teaching" in q_lower or ("how many" in q_lower and "course" in q_lower):
+    if "teaching" in q_lower or "teach" in q_lower or ("how many" in q_lower and "course" in q_lower):
         variants.append("schedule draft teaching courses instructor")
+        variants.append("EE CS schedule draft courses")
     if "schedule" in q_lower or "spring" in q_lower or "fall" in q_lower:
         variants.append("EE CS schedule draft courses")
+        variants.append("schedule draft spring fall semester")
     # Degree requirements
     if "credits" in q_lower or "units" in q_lower or "minor" in q_lower:
         variants.append("coursework credits requirements units")
     if "master" in q_lower:
         variants.append("masters degree education university")
-    if "phd" in q_lower and ("where" in q_lower or "which" in q_lower):
-        variants.append("PhD degree education university")
-    # Awards/deadlines
-    if "award" in q_lower or "deadline" in q_lower:
-        variants.append("awards nomination deadline")
+    if "phd" in q_lower or "ph.d" in q_lower:
+        if "where" in q_lower or "which" in q_lower:
+            variants.append("PhD degree education university")
+        if re.search(r'\b(1[89]\d{2}|20\d{2})\b', question):
+            year = re.search(r'\b(1[89]\d{2}|20\d{2})\b', question).group(1)
+            variants.append(f"PhD {year} memoriam faculty dissertation")
+            variants.append(f"Ph.D. {year}")
+    if "earned" in q_lower and ("phd" in q_lower or "ph.d" in q_lower or "doctorate" in q_lower):
+        variants.append("memoriam PhD doctorate earned faculty")
+    # Awards/deadlines/prizes
+    if "award" in q_lower or "deadline" in q_lower or "prize" in q_lower:
+        variants.append("awards nomination deadline prize")
+        variants.append("ACM IEEE award prize distinguished")
     if "fellowship" in q_lower:
         variants.append("fellowship award graduate student")
+        variants.append("Sloan fellowship award faculty")
     # Office/contact info
     if "office" in q_lower or "room" in q_lower:
-        variants.append("office room hall contact")
+        variants.append("office room hall contact Soda Cory")
     if "email" in q_lower:
         variants.append("email contact address")
+    if "phone" in q_lower:
+        variants.append("phone number telephone contact")
+    # Percentage/demographics questions
+    if "percentage" in q_lower or "percent" in q_lower:
+        variants.append("demographics percentage enrollment statistics by the numbers")
+        variants.append("international students residents percentage demographics")
+    # Lab/research questions
+    if "lab" in q_lower or "research" in q_lower:
+        variants.append("lab laboratory research center")
+    # Counting questions about courses at specific level
+    if "how many" in q_lower and ("294" in q_lower or "294" in question):
+        variants.append("CS 294 courses spring schedule")
+    if "how many" in q_lower:
+        variants.append(question.replace("How many", "").replace("how many", "").strip())
+    # Historical questions
+    if "hired" in q_lower or "first" in q_lower or "black" in q_lower:
+        variants.append("first Black hired history memoriam")
+    # Building/location
+    if "hall" in q_lower or "building" in q_lower or "floor" in q_lower:
+        variants.append("Soda Cory hall building floor location")
+    # Ranking
+    if "ranking" in q_lower or "ranked" in q_lower:
+        variants.append("ranking QS world university top ranked")
+    # Contact/media
+    if "contact" in q_lower or "media" in q_lower:
+        variants.append("media contact communications press")
+    # Capacity/reservation
+    if "capacity" in q_lower:
+        variants.append("capacity room seats occupancy")
+    if "reservation" in q_lower or "book" in q_lower:
+        variants.append("room reservation booking lounge")
 
     return variants
 
@@ -122,20 +194,22 @@ def score_url(question, url, best_chunk_score):
     if "advisor" in q_lower and "thesis" not in q_lower and "advising" in url_lower:
         bonus += 25
     if ("born" in q_lower or "earliest" in q_lower or "oldest" in q_lower) and "memoriam" in url_lower:
-        # Strongly prefer the main in-memoriam list page over individual memorial articles
-        if "/people/faculty/in-memoriam" in url_lower:
+        if "/people/faculty/in-memoriam" in url_lower or "in-memoriam" in url_lower:
             bonus += 50
         else:
             bonus += 10
-    if ("schedule" in q_lower or "teaching" in q_lower) and "schedule" in url_lower:
+    if ("passed away" in q_lower or "died" in q_lower) and "memoriam" in url_lower:
+        bonus += 30
+    if ("schedule" in q_lower or "teaching" in q_lower or "teach" in q_lower) and "schedule" in url_lower:
         bonus += 20
     if ("how many" in q_lower and "course" in q_lower) and "schedule" in url_lower:
-        bonus += 20
+        bonus += 25
     if ("credit" in q_lower or "coursework" in q_lower or "minor" in q_lower) and "coursework" in url_lower:
         bonus += 25
-    if ("thesis" in q_lower or "dissertation" in q_lower) and "Pubs/TechRpts" in url:
-        bonus += 20
-    if ("master" in q_lower or "phd" in q_lower or "education" in q_lower):
+    if ("thesis" in q_lower or "dissertation" in q_lower):
+        if "Pubs/TechRpts" in url or "Dissertations" in url or "Pubs/" in url:
+            bonus += 20
+    if ("master" in q_lower or "phd" in q_lower or "ph.d" in q_lower or "education" in q_lower):
         if "homepage" in url_lower or "Faculty/Homepages" in url:
             bonus += 15
         if "book/faculty" in url_lower:
@@ -143,34 +217,92 @@ def score_url(question, url, best_chunk_score):
     if "homepage" in url_lower or "Faculty/Homepages" in url:
         for name in names:
             bonus += 5
+    # Demographics/percentage questions
+    if ("percentage" in q_lower or "percent" in q_lower or "how many" in q_lower and "student" in q_lower):
+        if "by-the-numbers" in url_lower or "numbers" in url_lower:
+            bonus += 50
+    # Award/prize pages
+    if ("award" in q_lower or "prize" in q_lower or "fellow" in q_lower):
+        if "awards" in url_lower or "Awards" in url:
+            bonus += 20
+    # Schedule pages for course-specific questions
+    if re.search(r'(?:CS|EE|EECS)\s*\d+', question, re.IGNORECASE) and "schedule" in url_lower:
+        bonus += 15
+    # Colloquium pages
+    if "colloquium" in q_lower and "colloqui" in url_lower:
+        bonus += 30
+    # BEARS symposium
+    if "bears" in q_lower and "bears" in url_lower:
+        bonus += 30
+    # Phone/contact for specific buildings
+    if "phone" in q_lower and ("building" in q_lower or "hall" in q_lower or "manager" in q_lower):
+        if "building" in url_lower or "facilities" in url_lower or "contact" in url_lower:
+            bonus += 20
+    # PhD earned in specific year
+    if re.search(r'earned.*ph\.?d|ph\.?d.*\d{4}', q_lower):
+        if "memoriam" in url_lower:
+            bonus += 30
+    # Ranking
+    if "ranking" in q_lower and ("about" in url_lower or "numbers" in url_lower):
+        bonus += 25
+    # Residency
+    if "residency" in q_lower and ("residency" in url_lower or "financial" in url_lower):
+        bonus += 20
+    # Room/lounge booking
+    if ("lounge" in q_lower or "woz" in q_lower) and ("room" in url_lower or "lounge" in url_lower or "woz" in url_lower):
+        bonus += 25
+    # Distinguished alumni
+    if "distinguished" in q_lower and "alumni" in q_lower and "alumni" in url_lower:
+        bonus += 25
 
     return bonus
 
 
-def retrieve(question, bm25, docs, url_to_chunks, top_k=TOP_K_URLS):
-    """Retrieve top URLs, then merge all chunks from those URLs."""
+def retrieve(question, bm25, docs, url_to_chunks, dense_index=None, dense_model=None, top_k=TOP_K_URLS):
+    """Retrieve top URLs using hybrid BM25 + dense retrieval."""
     variants = generate_query_variants(question)
 
+    # --- BM25 scoring ---
     combined_scores = np.zeros(len(docs))
     for variant in variants:
         tokens = tokenize(variant)
         scores = bm25.get_scores(tokens)
         combined_scores += scores
 
+    # Normalize BM25 scores to [0, 1]
+    bm25_max = combined_scores.max()
+    if bm25_max > 0:
+        bm25_norm = combined_scores / bm25_max
+    else:
+        bm25_norm = combined_scores
+
+    # --- Dense scoring ---
+    dense_norm = np.zeros(len(docs))
+    if dense_index is not None and dense_model is not None:
+        q_emb = dense_model.encode([question], normalize_embeddings=True)
+        q_emb = np.array(q_emb, dtype=np.float32)
+        scores_dense, indices_dense = dense_index.search(q_emb, TOP_K_DENSE)
+        for score, idx in zip(scores_dense[0], indices_dense[0]):
+            if idx >= 0:
+                dense_norm[idx] = float(score)
+
+    # --- Hybrid scoring: 0.6 * BM25 + 0.4 * dense ---
+    hybrid_scores = 0.6 * bm25_norm + 0.4 * dense_norm
+
     # Score per URL: max chunk score + URL-level bonus
     url_scores = {}
     for idx in range(len(docs)):
-        if combined_scores[idx] <= 0:
+        if hybrid_scores[idx] <= 0:
             continue
         url = docs[idx]["url"]
-        score = float(combined_scores[idx])
+        score = float(hybrid_scores[idx])
         if url not in url_scores or score > url_scores[url]:
             url_scores[url] = score
 
-    # Add URL-level bonuses
+    # Add URL-level bonuses (scaled for hybrid scores)
     url_final_scores = {}
     for url, score in url_scores.items():
-        bonus = score_url(question, url, score)
+        bonus = score_url(question, url, score) * 0.01  # Scale bonuses for normalized scores
         url_final_scores[url] = score + bonus
 
     # Sort URLs by score
@@ -182,12 +314,9 @@ def retrieve(question, bm25, docs, url_to_chunks, top_k=TOP_K_URLS):
         chunk_indices = url_to_chunks.get(url, [])
         if not chunk_indices:
             continue
-        # Merge chunks, ordered by their position (use chunk id suffix)
         chunks = [docs[i] for i in chunk_indices]
-        # Sort by chunk index (extracted from id)
         chunks.sort(key=lambda c: int(c["id"].rsplit("_", 1)[-1]) if "_" in c["id"] else 0)
         merged_text = "\n".join(c["text"] for c in chunks)
-        # Deduplicate overlapping text
         results.append({
             "url": url,
             "title": chunks[0].get("title", ""),
@@ -197,9 +326,19 @@ def retrieve(question, bm25, docs, url_to_chunks, top_k=TOP_K_URLS):
     return results
 
 
+def get_question_guidance(question):
+    """Return question-type-specific guidance for the LLM."""
+    q_lower = question.lower()
+    hints = []
+    if "percentage" in q_lower or "percent" in q_lower:
+        hints.append("Give JUST the number.")
+    if "how long" in q_lower and "ago" in q_lower:
+        hints.append("Calculate from the current year 2026.")
+    return " ".join(hints)
+
+
 def build_prompt(question, passages):
     context_parts = []
-    # Give more space to the first (most relevant) passage
     for i, p in enumerate(passages, 1):
         text = p["text"]
         words = text.split()
@@ -209,11 +348,14 @@ def build_prompt(question, passages):
         context_parts.append(f"[{i}] {p.get('title', '')} ({p['url']})\n{text}")
     context = "\n\n".join(context_parts)
 
+    guidance = get_question_guidance(question)
+    guidance_line = f"\nNote: {guidance}" if guidance else ""
+
     return f"""Context from eecs.berkeley.edu:
 
 {context}
 
-Question: {question}
+Question: {question}{guidance_line}
 
 Answer with ONLY the exact short answer:"""
 
@@ -258,14 +400,14 @@ def clean_answer(answer):
         answer = answer.split("\n")[0].strip()
     if answer.endswith(".") and len(answer.split()) <= 10:
         answer = answer[:-1].strip()
-    # Remove trailing qualifiers like ", Belgium" or "at Berkeley"
-    # Strip country/location suffixes after a comma if short
+    # Remove trailing location qualifiers after comma (e.g. ", Belgium", ", CA")
+    # But preserve commas in time ranges, lists of names, etc.
     if "," in answer:
         parts = answer.split(",")
-        core = parts[0].strip()
-        # If the core part looks like a complete answer, use it
-        if len(core.split()) >= 1 and len(core.split()) <= 6:
-            answer = core
+        suffix = parts[-1].strip()
+        # Only strip if suffix looks like a location (1-2 words, no numbers/times)
+        if len(suffix.split()) <= 2 and not re.search(r'\d', suffix):
+            answer = ",".join(parts[:-1]).strip()
     # Remove "units" suffix from number answers but preserve "+" suffix
     answer = re.sub(r'(\d+\+?)\s+(?:semester\s+)?units?$', r'\1', answer, flags=re.IGNORECASE)
     # Truncate overly long answers
@@ -306,8 +448,8 @@ def filter_passages(question, passages):
     return passages
 
 
-def answer_question(question, bm25, docs, url_to_chunks):
-    passages = retrieve(question, bm25, docs, url_to_chunks)
+def answer_question(question, bm25, docs, url_to_chunks, dense_index=None, dense_model=None):
+    passages = retrieve(question, bm25, docs, url_to_chunks, dense_index, dense_model)
     if not passages:
         return safe_call_llm(
             f"Answer concisely about UC Berkeley EECS: {question}",
@@ -335,14 +477,14 @@ def main():
         questions = [line.strip() for line in f if line.strip()]
 
     print(f"Loaded {len(questions)} questions.", file=sys.stderr)
-    print("Loading BM25 index...", file=sys.stderr)
-    bm25, docs, url_to_chunks = load_index()
+    print("Loading indexes...", file=sys.stderr)
+    bm25, docs, url_to_chunks, dense_index, dense_model = load_index()
     print(f"Index loaded with {len(docs)} documents.", file=sys.stderr)
 
     answers = []
     for i, question in enumerate(questions):
         print(f"[{i+1}/{len(questions)}] {question[:80]}...", file=sys.stderr)
-        answer = answer_question(question, bm25, docs, url_to_chunks)
+        answer = answer_question(question, bm25, docs, url_to_chunks, dense_index, dense_model)
         answers.append(answer)
         print(f"  -> {answer}", file=sys.stderr)
 

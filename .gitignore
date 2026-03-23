@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
-corpus/*.pkl
-corpus/chunks.jsonl
-corpus/pages.jsonl
-data/predictions.txt
-data/predictions_timing.txt
 .env
+submission.zip
+corpus/chunks.jsonl
+corpus/chunks_hidden.jsonl
+corpus/pages.jsonl
+corpus/*_orig.pkl
+corpus/*_hidden.pkl
+corpus/dense_docs.pkl
