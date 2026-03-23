@@ -484,7 +484,11 @@ def main():
     answers = []
     for i, question in enumerate(questions):
         print(f"[{i+1}/{len(questions)}] {question[:80]}...", file=sys.stderr)
-        answer = answer_question(question, bm25, docs, url_to_chunks, dense_index, dense_model)
+        try:
+            answer = answer_question(question, bm25, docs, url_to_chunks, dense_index, dense_model)
+        except Exception as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            answer = "unknown"
         answers.append(answer)
         print(f"  -> {answer}", file=sys.stderr)
 
